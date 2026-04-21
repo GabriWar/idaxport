@@ -45,21 +45,78 @@ except Exception:
 WORKER_COUNT = max(1, mp.cpu_count() - 1)
 TASK_BATCH_SIZE = 50
 _LAST_SUB_PROGRESS = [0]  # mutable for closure
+# Per (label,total) timing for ETA; cleared when _last_sub_pr_reset() runs
+_SUB_PROGRESS_STATE = {}
+
+
+def _format_eta_hms(seconds):
+    """Human-readable duration for logs."""
+    if seconds is None or seconds < 0 or seconds == float("inf"):
+        return "?"
+    if seconds >= 86400:
+        return "{:.1f}d".format(seconds / 86400)
+    if seconds >= 3600:
+        return "{:.1f}h".format(seconds / 3600)
+    if seconds >= 60:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return "{}m{:02d}s".format(m, s)
+    return "{:.0f}s".format(seconds)
+
+
+def _last_sub_pr_reset():
+    """Reset progress throttle + ETA baselines (call at start of each major sub-phase)."""
+    _LAST_SUB_PROGRESS[0] = -1
+    _SUB_PROGRESS_STATE.clear()
+    _SUB_PROGRESS_STATE.clear()
 
 
 def print_sub_progress(current, total, label=""):
-    """Print granular sub-task progress (throttled to every 2%)"""
+    """Granular sub-task progress with ETA, rate, and time-based heartbeats (same % for many items)."""
     if total <= 0:
         return
+    now = time.time()
     pct = int(100 * current / total)
-    # Only print every 2% or at the end
-    if pct == _LAST_SUB_PROGRESS[0] and current < total:
-        return
+    key = "{}|{}".format(label, total)
+
+    st = _SUB_PROGRESS_STATE.get(key)
+    if st is None:
+        st = {"start": now, "last_pct": -999, "last_out": 0.0}
+        _SUB_PROGRESS_STATE[key] = st
+
+    # Original throttle: new integer % milestone
+    milestone = pct != st["last_pct"]
+    # Extra: heartbeat every 20s while stuck in same % (huge binaries spend ages within one %)
+    heartbeat = (now - st["last_out"]) >= 20.0 and current < total
+    if not milestone and not heartbeat:
+        if not (current >= total and pct == 100):
+            return
+    if milestone:
+        st["last_pct"] = pct
+    st["last_out"] = now
     _LAST_SUB_PROGRESS[0] = pct
+
     width = 30
     filled = int(width * current / total)
     bar = "█" * filled + "░" * (width - filled)
-    print("    [{}] {}/{} {:.0f}% {}".format(bar, current, total, pct, label))
+
+    elapsed = now - st["start"]
+    extra = ""
+    if current > 0 and current < total and elapsed >= 0.5:
+        rate = current / elapsed
+        if rate > 0:
+            rem = (total - current) / rate
+            extra = " | elapsed {} | ~{} left @ {:.1f}/s".format(
+                _format_eta_hms(elapsed), _format_eta_hms(rem), rate
+            )
+    elif current >= total:
+        extra = " | done in {}".format(_format_eta_hms(elapsed))
+
+    print("    [{}] {}/{} {:>3}% {}{}".format(bar, current, total, pct, label, extra))
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def get_worker_count():
@@ -286,7 +343,7 @@ def export_decompiled_functions(export_dir, skip_existing=True):
         return
 
     total_remaining = len(remaining_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     # 流式处理 - 不预加载所有调用关系
     BATCH_SIZE = 10  # 减小批量大小
@@ -573,7 +630,7 @@ def export_strings(export_dir):
 
     string_count = 0
     BATCH_SIZE = 500  # 每500个字符串清理一次
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(strings_path, 'w', encoding='utf-8') as f:
         f.write("# Strings exported from IDA\n")
@@ -675,7 +732,7 @@ def export_memory(export_dir):
     total_bytes = 0
     file_count = 0
     total_segs = ida_segment.get_segm_qty()
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     for seg_idx in range(total_segs):
         seg = ida_segment.getnseg(seg_idx)
@@ -1075,7 +1132,7 @@ def export_structs_enums(export_dir):
 
     type_count = 0
     total_ordinals = ida_typeinf.get_ordinal_count(til)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(types_path, 'w', encoding='utf-8') as f:
         f.write("# Local Types (structs, enums, typedefs)\n")
@@ -1225,7 +1282,7 @@ def export_function_prototypes(export_dir):
     proto_count = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(protos_path, 'w', encoding='utf-8') as f:
         f.write("# Function Prototypes\n")
@@ -1290,7 +1347,7 @@ def export_comments(export_dir):
         f.write("# Format: address | name | comment_type | comment\n")
         f.write("#" + "-" * 60 + "\n\n")
 
-        _LAST_SUB_PROGRESS[0] = -1
+        _last_sub_pr_reset()
         for idx, func_ea in enumerate(all_funcs):
             print_sub_progress(idx + 1, total_funcs, "func comments")
             func_name = idc.get_func_name(func_ea)
@@ -1315,7 +1372,7 @@ def export_comments(export_dir):
 
         # Iterate all heads for line comments
         total_segs = ida_segment.get_segm_qty()
-        _LAST_SUB_PROGRESS[0] = -1
+        _last_sub_pr_reset()
         for seg_idx in range(total_segs):
             seg = ida_segment.getnseg(seg_idx)
             if seg is None:
@@ -1366,7 +1423,7 @@ def export_xrefs(export_dir):
     code_xref_count = 0
     data_xref_count = 0
     total_segs = ida_segment.get_segm_qty()
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(xrefs_path, 'w', encoding='utf-8') as f:
         f.write("# Full Cross-Reference Map\n")
@@ -1431,7 +1488,7 @@ def export_callgraph(export_dir):
         func_names[func_ea] = idc.get_func_name(func_ea)
 
     # Build adjacency list
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
     for idx, func_ea in enumerate(all_funcs):
         print_sub_progress(idx + 1, total_funcs, "callgraph")
         callees = get_callees(func_ea)
@@ -1458,7 +1515,7 @@ def export_vtables(export_dir):
     ptr_size = _ptr_export_get_ptr_size()
     all_names = list(idautils.Names())
     total_names = len(all_names)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(vtables_path, 'w', encoding='utf-8') as f:
         f.write("# Vtables and Class Hierarchy\n")
@@ -1611,7 +1668,7 @@ def export_disassembly(export_dir):
     skipped = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     for idx, func_ea in enumerate(all_funcs):
         print_sub_progress(idx + 1, total_funcs, "disassembly")
@@ -1660,7 +1717,7 @@ def export_globals(export_dir):
     count = 0
     all_names = list(idautils.Names())
     total_names = len(all_names)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(globals_path, 'w', encoding='utf-8') as f:
         f.write("# Global Variables\n")
@@ -1765,7 +1822,7 @@ def export_stack_frames(export_dir):
 
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(frames_path, 'w', encoding='utf-8') as f:
         f.write("# Stack Frame Layouts\n")
@@ -1849,7 +1906,7 @@ def export_flirt_matches(export_dir):
     count = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(flirt_path, 'w', encoding='utf-8') as f:
         f.write("# FLIRT Signature Matches\n")
@@ -1927,7 +1984,7 @@ def export_enum_usage(export_dir):
 
         # Scan code for operands that reference enum values
         total_segs = ida_segment.get_segm_qty()
-        _LAST_SUB_PROGRESS[0] = -1
+        _last_sub_pr_reset()
         for seg_idx in range(total_segs):
             seg = ida_segment.getnseg(seg_idx)
             if seg is None:
@@ -1972,7 +2029,7 @@ def export_data_xref_graph(export_dir):
     globals_info = {}
     all_names = list(idautils.Names())
     total_names = len(all_names)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
     for idx, (ea, name) in enumerate(all_names):
         print_sub_progress(idx + 1, total_names, "collecting globals")
         flags = idc.get_full_flags(ea)
@@ -1990,7 +2047,7 @@ def export_data_xref_graph(export_dir):
 
     # For each global, find which functions reference it
     total_globals = len(globals_info)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
     for idx, (data_ea, info) in enumerate(globals_info.items()):
         print_sub_progress(idx + 1, total_globals, "data xrefs")
         for xref in idautils.XrefsTo(data_ea, 0):
@@ -2032,7 +2089,7 @@ def export_switch_tables(export_dir):
     count = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(switch_path, 'w', encoding='utf-8') as f:
         f.write("# Switch / Jump Tables\n")
@@ -2096,7 +2153,7 @@ def export_exceptions(export_dir):
     count = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(exceptions_path, 'w', encoding='utf-8') as f:
         f.write("# Exception Handlers / SEH / Try-Catch\n")
@@ -2157,7 +2214,7 @@ def export_fixups(export_dir):
         ida_fixup.FIXUP_OFF32: "OFF32",
         ida_fixup.FIXUP_OFF64: "OFF64",
     }
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(fixups_path, 'w', encoding='utf-8') as f:
         f.write("# Relocations / Fixups\n")
@@ -2214,7 +2271,7 @@ def export_microcode(export_dir):
 
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     for idx, func_ea in enumerate(all_funcs):
         print_sub_progress(idx + 1, total_funcs, "microcode")
@@ -2308,7 +2365,7 @@ def export_debug_info(export_dir):
     count = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(debug_path, 'w', encoding='utf-8') as f:
         f.write("# Debug Information (Source Mappings)\n")
@@ -2350,7 +2407,7 @@ def export_colors(export_dir):
 
     count = 0
     total_segs = ida_segment.get_segm_qty()
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(colors_path, 'w', encoding='utf-8') as f:
         f.write("# Color Markings\n")
@@ -2387,7 +2444,7 @@ def export_custom_data_types(export_dir):
     til = ida_typeinf.get_idati()
     all_names = list(idautils.Names())
     total_names = len(all_names)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(custom_path, 'w', encoding='utf-8') as f:
         f.write("# Applied Structure Types at Addresses\n")
@@ -2512,7 +2569,7 @@ def export_string_xrefs(export_dir):
 
     count = 0
     str_idx = 0
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(sxref_path, 'w', encoding='utf-8') as f:
         f.write("# String Cross-References\n")
@@ -2558,7 +2615,7 @@ def export_function_chunks(export_dir):
     count = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(chunks_path, 'w', encoding='utf-8') as f:
         f.write("# Function Chunks (Non-Contiguous Code)\n")
@@ -2592,7 +2649,7 @@ def export_undefined_ranges(export_dir):
     count = 0
     total_bytes = 0
     total_segs = ida_segment.get_segm_qty()
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(undef_path, 'w', encoding='utf-8') as f:
         f.write("# Undefined / Unexplored Byte Ranges\n")
@@ -2782,7 +2839,7 @@ def export_operand_types(export_dir):
     count = 0
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
-    _LAST_SUB_PROGRESS[0] = -1
+    _last_sub_pr_reset()
 
     with open(opinfo_path, 'w', encoding='utf-8') as f:
         f.write("# Detailed Operand Information\n")
@@ -2976,7 +3033,7 @@ def export_per_function_pass(export_dir, skip_tasks=None):
 
         all_funcs = list(idautils.Functions())
         total_funcs = len(all_funcs)
-        _LAST_SUB_PROGRESS[0] = -1
+        _last_sub_pr_reset()
 
         active_tasks = []
         if do_prototypes: active_tasks.append('prototypes')
@@ -2994,6 +3051,11 @@ def export_per_function_pass(export_dir, skip_tasks=None):
         if do_microcode: active_tasks.append('microcode')
         print("[*] Per-function pass: {} functions, sub-tasks: {}".format(
             total_funcs, ", ".join(active_tasks)))
+        print("[*] Each `functions` progress line = one pass over all funcs (all enabled sub-tasks per func). ETA/~left = rate from recent progress; same-% lines refresh every 20s.")
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
 
         for idx, func_ea in enumerate(all_funcs):
             print_sub_progress(idx + 1, total_funcs, "functions")
@@ -3507,7 +3569,7 @@ def export_per_segment_pass(export_dir, skip_tasks=None):
         }
 
         total_segs = ida_segment.get_segm_qty()
-        _LAST_SUB_PROGRESS[0] = -1
+        _last_sub_pr_reset()
 
         for seg_idx in range(total_segs):
             seg = ida_segment.getnseg(seg_idx)
@@ -3685,7 +3747,7 @@ def export_per_name_pass(export_dir, skip_tasks=None):
 
         all_names = list(idautils.Names())
         total_names = len(all_names)
-        _LAST_SUB_PROGRESS[0] = -1
+        _last_sub_pr_reset()
 
         for idx, (ea, name) in enumerate(all_names):
             print_sub_progress(idx + 1, total_names, "names")
@@ -3848,7 +3910,7 @@ def export_per_name_pass(export_dir, skip_tasks=None):
         # --- Data xref graph: resolve xrefs for collected globals ---
         if do_data_xref:
             total_globals = len(globals_info)
-            _LAST_SUB_PROGRESS[0] = -1
+            _last_sub_pr_reset()
             for gidx, (data_ea, info) in enumerate(globals_info.items()):
                 if (gidx + 1) % 200 == 0:
                     print_sub_progress(gidx + 1, total_globals, "data xrefs")
