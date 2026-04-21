@@ -82,6 +82,50 @@ def ensure_dir(path):
         os.makedirs(path)
 
 
+def _log_ts(msg):
+    """Timestamped line for headless logs (flush so -L file updates during long steps)."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print("[{}] {}".format(ts, msg))
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+_AUTO_WAIT_HB_STOP = threading.Event()
+
+
+def _auto_wait_heartbeat_loop(start_wall, interval_sec):
+    """Background: print while ida_auto.auto_wait() runs (IDA is single-threaded; only this thread prints)."""
+    n = 0
+    while not _AUTO_WAIT_HB_STOP.wait(interval_sec):
+        n += 1
+        elapsed = time.time() - start_wall
+        _log_ts(
+            "auto_wait: still running ({:.0f}s elapsed, heartbeat #{} — IDA is analyzing; this is normal)".format(
+                elapsed, n
+            )
+        )
+
+
+def _run_auto_wait_with_heartbeat(interval_sec=45):
+    """ida_auto.auto_wait() with periodic log lines (otherwise headless looks frozen)."""
+    _log_ts("auto_wait: calling ida_auto.auto_wait() (first log after this may take many minutes)")
+    _AUTO_WAIT_HB_STOP.clear()
+    aw_start = time.time()
+    hb = threading.Thread(
+        target=_auto_wait_heartbeat_loop,
+        args=(aw_start, interval_sec),
+        daemon=True,
+    )
+    hb.start()
+    try:
+        ida_auto.auto_wait()
+    finally:
+        _AUTO_WAIT_HB_STOP.set()
+    _log_ts("auto_wait: ida_auto.auto_wait() returned after {:.1f}s".format(time.time() - aw_start))
+
+
 def clear_undo_buffer():
     """清理 IDA 撤销缓冲区，防止内存溢出"""
     try:
@@ -3873,6 +3917,20 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     print("=" * 60)
     print("[*] Using {} worker threads for parallel I/O".format(WORKER_COUNT))
 
+    try:
+        _inp = ida_nalt.get_input_file_path() or ""
+    except Exception:
+        _inp = ""
+    _log_ts(
+        "do_export: start | workers={} | ask_user={} | skip_auto_analysis={} | batch={} | input={}".format(
+            WORKER_COUNT,
+            ask_user,
+            skip_auto_analysis,
+            getattr(ida_kernwin.cvar, "batch", False),
+            _inp or "(unknown)",
+        )
+    )
+
     # 初始清理
     clear_undo_buffer()
 
@@ -3883,23 +3941,28 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         print("[!] Hex-Rays decompiler is not available!")
         print("[!] Strings will still be exported, but no decompilation.")
         has_hexrays = False
+        _log_ts("hexrays: NOT available (decompile steps will be skipped or degraded)")
     else:
         has_hexrays = True
         print("[+] Hex-Rays decompiler initialized")
+        _log_ts("hexrays: OK")
 
     if not skip_auto_analysis:
         print("[*] Waiting for auto-analysis to complete...")
         print("[*] Tip: This may take a while for large files. Press Ctrl+Break to cancel.")
+        _log_ts("auto_wait: beginning (heartbeats every 45s until done)")
 
         # 在auto_wait之前清理一次
         clear_undo_buffer()
 
-        ida_auto.auto_wait()
+        _run_auto_wait_with_heartbeat(interval_sec=45)
 
         # auto_wait之后立即清理
         clear_undo_buffer()
+        _log_ts("auto_wait: finished, continuing to export phases")
     else:
         print("[*] Skipping auto-analysis wait (assuming already complete)")
+        _log_ts("auto_wait: SKIPPED (skip_auto_analysis=True)")
 
     if export_dir is None:
         idb_dir = get_idb_directory()
@@ -3931,6 +3994,11 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     ensure_dir(export_dir)
 
     print("[+] Export directory: {}".format(export_dir))
+    _log_ts("export_dir: {}".format(export_dir))
+    if skip_tasks:
+        _log_ts("skip_tasks: {} items — {}".format(len(skip_tasks), ", ".join(sorted(skip_tasks))))
+    else:
+        _log_ts("skip_tasks: (none)")
     print("")
 
     # Phase 1: Independent exports (not part of the 3 consolidated passes)
@@ -3977,10 +4045,14 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     for task_idx, (task_name, task_func) in enumerate(independent_tasks):
         print_progress_bar(task_idx, total_tasks, task_name)
         print("[*] [{}/{}] Exporting {}...".format(task_idx + 1, total_tasks, task_name))
+        _t0 = time.time()
+        _log_ts("phase1: BEGIN '{}' ({}/{})".format(task_name, task_idx + 1, total_tasks))
         try:
             task_func(export_dir)
         except Exception as e:
             print("[!] Failed to export {}: {}".format(task_name, str(e)))
+            _log_ts("phase1: ERROR '{}' — {}".format(task_name, str(e)))
+        _log_ts("phase1: END '{}' ({:.1f}s)".format(task_name, time.time() - _t0))
         clear_undo_buffer()
 
     task_idx = len(independent_tasks)
@@ -3989,24 +4061,32 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     task_idx += 1
     print_progress_bar(task_idx - 1, total_tasks, "Per-name pass (globals, vtables, structs, data xrefs, labels)")
     print("[*] [{}/{}] Running per-name pass...".format(task_idx, total_tasks))
+    _t0 = time.time()
+    _log_ts("phase2: BEGIN per-name pass")
     try:
         export_per_name_pass(export_dir, skip_tasks=skip_tasks)
     except Exception as e:
         print("[!] Per-name pass failed: {}".format(str(e)))
+        _log_ts("phase2: ERROR — {}".format(str(e)))
         import traceback
         traceback.print_exc()
+    _log_ts("phase2: END per-name pass ({:.1f}s)".format(time.time() - _t0))
     clear_undo_buffer()
 
     # Phase 3: Per-segment pass
     task_idx += 1
     print_progress_bar(task_idx - 1, total_tasks, "Per-segment pass (xrefs, comments, enums, colors, undef)")
     print("[*] [{}/{}] Running per-segment pass...".format(task_idx, total_tasks))
+    _t0 = time.time()
+    _log_ts("phase3: BEGIN per-segment pass")
     try:
         export_per_segment_pass(export_dir, skip_tasks=skip_tasks)
     except Exception as e:
         print("[!] Per-segment pass failed: {}".format(str(e)))
+        _log_ts("phase3: ERROR — {}".format(str(e)))
         import traceback
         traceback.print_exc()
+    _log_ts("phase3: END per-segment pass ({:.1f}s)".format(time.time() - _t0))
     clear_undo_buffer()
 
     # Phase 4: Per-function pass (heaviest)
@@ -4014,16 +4094,21 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     print_progress_bar(task_idx - 1, total_tasks, "Per-function pass (prototypes, decompile, disasm, callgraph, ...)")
     print("[*] [{}/{}] Running per-function pass...".format(task_idx, total_tasks))
     print("[*] Tip: If IDA crashes during decompilation, restart and export will resume")
+    _t0 = time.time()
+    _log_ts("phase4: BEGIN per-function pass (slow on large binaries)")
     try:
         export_per_function_pass(export_dir, skip_tasks=skip_tasks)
     except Exception as e:
         print("[!] Per-function pass failed: {}".format(str(e)))
+        _log_ts("phase4: ERROR — {}".format(str(e)))
         import traceback
         traceback.print_exc()
+    _log_ts("phase4: END per-function pass ({:.1f}s)".format(time.time() - _t0))
     clear_undo_buffer()
 
     elapsed = time.time() - start_time
     print_progress_bar(total_tasks, total_tasks, "DONE in {:.1f}s".format(elapsed))
+    _log_ts("do_export: all phases finished in {:.1f}s total (export work only, excludes auto_wait)".format(elapsed))
 
     # 恢复撤销功能
     enable_undo()
