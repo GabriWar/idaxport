@@ -4034,7 +4034,10 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     print("    Output directory: {}".format(export_dir))
     print("=" * 60)
 
-    ida_kernwin.info("Export completed!\n\nOutput directory:\n{}".format(export_dir))
+    if not getattr(ida_kernwin.cvar, "batch", False):
+        ida_kernwin.info("Export completed!\n\nOutput directory:\n{}".format(export_dir))
+    else:
+        print("[+] Export completed (batch mode, no modal): {}".format(export_dir))
 
 
 # ============================================================================
