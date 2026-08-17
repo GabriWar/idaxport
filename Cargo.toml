@@ -1,0 +1,23 @@
+[package]
+name = "inp"
+version = "0.1.0"
+edition = "2021"
+description = "IDA export for AI analysis (Rust, powered by idalib)"
+license = "MIT"
+
+# Default: crates.io deps (works on CI / fresh clones without a local SDK checkout).
+# For local development against a checked-out idalib repo, see Cargo.toml.dev.example
+# (copy to Cargo.toml.dev or swap the lines below to use path deps).
+[dependencies]
+idalib = "0.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rayon = "1"
+
+[build-dependencies]
+idalib-build = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

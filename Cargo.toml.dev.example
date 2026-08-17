@@ -1,0 +1,17 @@
+# Example Cargo.toml for LOCAL DEVELOPMENT against a checked-out idalib repo.
+#
+# The committed Cargo.toml uses crates.io deps (`idalib = "0.9"`), which works on
+# CI and fresh clones. If you're hacking on idalib itself or need a local build
+# (e.g. to work around a bug, or pin to an unreleased commit), copy this file's
+# dependency lines over the [dependencies]/[build-dependencies] in Cargo.toml.
+#
+# Adjust the paths below to point at YOUR local idalib workspace.
+
+[dependencies]
+idalib = { path = "/Users/yemur/Documents/code/sdk/rustsdk/idalib/idalib" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rayon = "1"
+
+[build-dependencies]
+idalib-build = { path = "/Users/yemur/Documents/code/sdk/rustsdk/idalib/idalib-build" }

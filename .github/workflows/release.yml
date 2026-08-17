@@ -1,0 +1,100 @@
+# Multi-platform release build for `inp` (IDA export for AI, Rust + idalib).
+#
+# IMPORTANT — why each platform builds natively (no cross-compile):
+#   The binary links against IDA's commercial `libida`/`libidalib`, which are
+#   per-platform and shipped only inside each platform's IDA installer. They are
+#   NOT redistributable and NOT present on a fresh CI runner. idalib's build
+#   links against SDK *stub* libraries (enough to build) but the README warns
+#   stubs crash at runtime (idalib issue #24) — so a binary built here will
+#   COMPILE on every platform but only RUN where a real IDA is installed.
+#
+# To produce a runnable binary on a runner, you must additionally:
+#   1. Install IDA Pro 9.3 for that platform on the runner (commercial license).
+#   2. Set IDADIR to its install dir (e.g. via a secret → env below).
+#   3. Re-run with the "with-ida" job input, or just `cargo build --release`
+#      after IDADIR is set so configure_linkage() points rpath at the real libs.
+#
+# Without IDA on the runner, the jobs below still prove the project *compiles*
+# cleanly on each OS (catching platform-specific API/regression issues).
+
+name: release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both Apple Silicon and Intel macOS.
+        include:
+          - os: macos-14      # M1
+            target: aarch64-apple-darwin
+          - os: macos-13      # Intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: inp-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/inp
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install LLVM/Clang (bindgen dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+      - name: Build (release)
+        run: cargo build --release
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: inp-x86_64-unknown-linux-gnu
+          path: target/release/inp
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install LLVM/Clang (bindgen dependency)
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: "20"
+      - name: Configure LIBCLANG_PATH
+        shell: bash
+        run: echo "LIBCLANG_PATH=$(dirname $(which clang))" >> $GITHUB_ENV
+      - name: Build (release)
+        run: cargo build --release
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: inp-x86_64-pc-windows-msvc
+          path: target/release/inp.exe
+          if-no-files-found: error

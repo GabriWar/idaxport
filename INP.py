@@ -44,6 +44,22 @@ except Exception:
 
 WORKER_COUNT = max(1, mp.cpu_count() - 1)
 TASK_BATCH_SIZE = 50
+
+# Export modes (ported from IDA-NO-MCP upstream: avoids RAM + token blowup on huge binaries)
+#   auto         : legacy below LARGE_BINARY_FUNC_THRESHOLD funcs, consolidated above
+#   legacy       : one file per function (decompile/*.c, disassembly/*.asm)
+#   consolidated : single decompiled.c + disassembly.asm + function_list.txt
+EXPORT_MODE_AUTO = "auto"
+EXPORT_MODE_LEGACY = "legacy"
+EXPORT_MODE_CONSOLIDATED = "consolidated"
+EXPORT_MODES = (EXPORT_MODE_AUTO, EXPORT_MODE_LEGACY, EXPORT_MODE_CONSOLIDATED)
+EXPORT_MODE_DEFAULT = EXPORT_MODE_AUTO
+
+LARGE_BINARY_FUNC_THRESHOLD = 20000  # above this, auto mode switches to consolidated
+LARGE_STRING_MIN_LEN = 4             # consolidated: drop shorter strings (noise, tokens)
+# Hex-Rays cfunc_t cache clear interval (funcs). ~130KB/func leaks without this.
+DECOMPILE_CACHE_CLEAR_LEGACY = 200
+DECOMPILE_CACHE_CLEAR_CONSOLIDATED = 100
 _LAST_SUB_PROGRESS = [0]  # mutable for closure
 # Per (label,total) timing for ETA; cleared when _last_sub_pr_reset() runs
 _SUB_PROGRESS_STATE = {}
@@ -124,19 +140,91 @@ def get_worker_count():
     return WORKER_COUNT
 
 
-def get_idb_directory():
-    """获取 IDB 文件所在目录"""
+def _get_idb_path():
+    """Input file path, falling back to the IDB path."""
     idb_path = ida_nalt.get_input_file_path()
     if not idb_path:
-        import ida_loader
-        idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-    return os.path.dirname(idb_path) if idb_path else os.getcwd()
+        try:
+            import ida_loader
+            idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        except Exception:
+            idb_path = None
+    return idb_path
+
+
+def _is_writable_dir(path):
+    """True only for an existing, writable directory.
+
+    Guards the [WinError 3] 'G:\\' case: the binary's drive may be unmounted or
+    on a dead network path, where makedirs raises a bare OS error.
+    """
+    if not path:
+        return False
+    try:
+        return os.path.isdir(path) and os.access(path, os.W_OK)
+    except Exception:
+        return False
+
+
+def _pick_writable_base_dir(candidates):
+    """First writable candidate, else cwd."""
+    for cand in candidates:
+        if _is_writable_dir(cand):
+            return cand
+    return os.getcwd()
+
+
+def get_idb_directory():
+    """获取 IDB 文件所在目录 (writability-checked, falls back to cwd)"""
+    idb_path = _get_idb_path()
+    return _pick_writable_base_dir([os.path.dirname(idb_path) if idb_path else None])
+
+
+def get_default_export_dir():
+    """Default export dir: `<input file name>_export_for_ai`, next to the binary.
+
+    Falls back to cwd when the binary's directory is not writable.
+    """
+    idb_path = _get_idb_path()
+    if idb_path:
+        input_dir = os.path.dirname(idb_path)
+        file_name = os.path.basename(idb_path)
+    else:
+        input_dir = None
+        file_name = "input.bin"
+    base_dir = _pick_writable_base_dir([input_dir])
+    return os.path.join(base_dir, "{}_export_for_ai".format(file_name))
 
 
 def ensure_dir(path):
-    """确保目录存在"""
-    if not os.path.exists(path):
-        os.makedirs(path)
+    """确保目录存在且可写 (clear error instead of a raw WinError)"""
+    if not path:
+        raise ValueError("ensure_dir: path is empty")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        raise OSError("Cannot create export directory '{}': {}. "
+                      "If the original binary's drive is unmounted (e.g. 'G:\\'), "
+                      "move the IDB to a writable local path.".format(path, e))
+    if not _is_writable_dir(path):
+        raise OSError("Export directory exists but is not writable: '{}'".format(path))
+    return path
+
+
+def _write_text_file(path, text):
+    """Blocking file write, run on the I/O pool so the main thread keeps decompiling."""
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(text)
+    return path
+
+
+def _resolve_export_mode(mode, func_count):
+    """auto -> legacy/consolidated by function count; explicit modes pass through."""
+    if mode not in EXPORT_MODES:
+        mode = EXPORT_MODE_DEFAULT
+    if mode == EXPORT_MODE_AUTO:
+        return EXPORT_MODE_CONSOLIDATED if func_count > LARGE_BINARY_FUNC_THRESHOLD else EXPORT_MODE_LEGACY
+    return mode
 
 
 def _log_ts(msg):
@@ -624,23 +712,33 @@ def export_decompiled_functions(export_dir, skip_existing=True):
         print("    Function index saved to: function_index.txt")
 
 
-def export_strings(export_dir):
-    """导出所有字符串"""
+def export_strings(export_dir, min_len=0):
+    """导出所有字符串 (min_len>0 drops shorter strings: noise + tokens)"""
     strings_path = os.path.join(export_dir, "strings.txt")
 
     string_count = 0
+    skipped_count = 0
     BATCH_SIZE = 500  # 每500个字符串清理一次
     _last_sub_pr_reset()
 
     with open(strings_path, 'w', encoding='utf-8') as f:
         f.write("# Strings exported from IDA\n")
         f.write("# Format: address | length | type | string\n")
+        if min_len > 0:
+            f.write("# (min_len filter={} applied)\n".format(min_len))
         f.write("#" + "=" * 80 + "\n\n")
 
         for idx, s in enumerate(idautils.Strings()):
             if idx % 100 == 0:
                 print("    [{} strings processed]".format(idx))
             try:
+                try:
+                    slen = int(s.length)
+                except Exception:
+                    slen = 0
+                if min_len > 0 and slen < min_len:
+                    skipped_count += 1
+                    continue
                 string_content = str(s)
                 str_type = "ASCII"
                 if s.strtype == ida_nalt.STRTYPE_C_16:
@@ -650,7 +748,7 @@ def export_strings(export_dir):
 
                 f.write("{} | {} | {} | {}\n".format(
                     hex(s.ea),
-                    s.length,
+                    slen,
                     str_type,
                     string_content.replace('\n', '\\n').replace('\r', '\\r')
                 ))
@@ -665,6 +763,8 @@ def export_strings(export_dir):
 
     print("[*] Strings Summary:")
     print("    Total strings exported: {}".format(string_count))
+    if min_len > 0:
+        print("    Skipped by min_len={}: {}".format(min_len, skipped_count))
 
 
 def export_imports(export_dir):
@@ -2903,7 +3003,7 @@ def export_operand_types(export_dir):
 # Consolidated Single-Pass Export Functions
 # ============================================================================
 
-def export_per_function_pass(export_dir, skip_tasks=None):
+def export_per_function_pass(export_dir, skip_tasks=None, export_mode=None):
     """Single pass over all functions, writing to multiple output files simultaneously.
 
     Replaces: export_function_prototypes, export_stack_frames, export_callgraph,
@@ -2939,16 +3039,81 @@ def export_per_function_pass(export_dir, skip_tasks=None):
     else:
         do_stack_frames_hexrays = do_stack_frames
 
-    # Create directories
-    if do_disassembly:
+    # Resolve export mode (auto -> legacy/consolidated by function count)
+    try:
+        mode_func_count = sum(1 for _ in idautils.Functions())
+    except Exception:
+        mode_func_count = 0
+    requested_mode = export_mode or EXPORT_MODE_DEFAULT
+    resolved_mode = _resolve_export_mode(requested_mode, mode_func_count)
+    consolidated = (resolved_mode == EXPORT_MODE_CONSOLIDATED)
+    print("[*] Export mode: {} -> resolved={} ({} funcs)".format(
+        requested_mode, resolved_mode, mode_func_count))
+    if consolidated and do_microcode:
+        # per-function .ctree files explode exactly like decompile/*.c; decompiled.c covers it
+        print("[*] consolidated mode: skipping per-function microcode/ctree files")
+        do_microcode = False
+
+    # Create directories (per-function files only exist in legacy mode)
+    if do_disassembly and not consolidated:
         disasm_dir = os.path.join(export_dir, "disassembly")
         ensure_dir(disasm_dir)
-    if do_decompile:
+    if do_decompile and not consolidated:
         decompile_dir = os.path.join(export_dir, "decompile")
         ensure_dir(decompile_dir)
     if do_microcode:
         micro_dir = os.path.join(export_dir, "microcode")
         ensure_dir(micro_dir)
+
+    # I/O pool: legacy mode writes one file per function, so the open/write/close
+    # syscalls dominate. Hand them to workers and keep the main thread on IDA APIs
+    # (IDA APIs stay on the main thread; only plain file writes are offloaded).
+    io_pool = None
+    io_futures = []
+    if not consolidated and (do_decompile or do_disassembly or do_microcode):
+        io_workers = max(2, min(8, (os.cpu_count() or 2)))
+        io_pool = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="INP-IO")
+        print("[*] I/O pool: {} writer threads".format(io_workers))
+
+    def drain_io(force=False):
+        """Collect finished writes; block only when the queue gets long."""
+        if io_pool is None or not io_futures:
+            return
+        if not force and len(io_futures) < 1024:
+            io_futures[:] = [fu for fu in io_futures if not fu.done()]
+            return
+        for fu in io_futures:
+            try:
+                fu.result()
+            except Exception as e:
+                print("[!] Write error: {}".format(str(e)))
+        io_futures[:] = []
+
+    def write_file_async(path, text):
+        """Queue a per-function file write (direct write when there is no pool)."""
+        if io_pool is None:
+            _write_text_file(path, text)
+            return
+        io_futures.append(io_pool.submit(_write_text_file, path, text))
+        if len(io_futures) >= 4096:
+            drain_io(force=True)
+
+    def write_callgraph_entry(func_ea, func_name, callees):
+        """Full call graph, no sampling: JSON dict in legacy, streamed text in
+        consolidated (a dict over millions of functions eats the RAM)."""
+        if consolidated:
+            files['callgraph_txt'].write("{:X} | {} -> {}\n".format(
+                func_ea, func_name,
+                ", ".join("{:X}:{}".format(c, ida_funcs.get_func_name(c) or "unknown")
+                          for c in callees) if callees else "none"))
+            counts['callgraph_edges'] += len(callees)
+        else:
+            func_names_map[func_ea] = func_name
+            callgraph[hex(func_ea)] = {
+                "name": func_name,
+                "calls": [hex(c) for c in callees],
+                "call_names": [func_names_map.get(c, idc.get_func_name(c) or "unknown") for c in callees],
+            }
 
     # Open all output files
     files = {}
@@ -2996,6 +3161,39 @@ def export_per_function_pass(export_dir, skip_tasks=None):
             files['operand'].write("# Detailed Operand Information\n")
             files['operand'].write("# Instructions with offset/struct/enum operand representations\n")
             files['operand'].write("#" + "=" * 80 + "\n\n")
+
+        if consolidated and do_decompile:
+            # append (not truncate): the progress file drives resume, so already
+            # exported functions must not be dropped from decompiled.c
+            dec_path = os.path.join(export_dir, "decompiled.c")
+            fresh = not os.path.exists(dec_path)
+            files['decompiled'] = open(dec_path, 'a', encoding='utf-8', buffering=1 << 20)
+            if fresh:
+                files['decompiled'].write("// Consolidated decompilation\n")
+                files['decompiled'].write("// Each function is preceded by a metadata header\n\n")
+            list_path = os.path.join(export_dir, "function_list.txt")
+            fresh = not os.path.exists(list_path)
+            files['func_list'] = open(list_path, 'a', encoding='utf-8')
+            if fresh:
+                files['func_list'].write("# Function List (consolidated mode)\n")
+                files['func_list'].write("# Format: address | name | export_type\n")
+                files['func_list'].write("#" + "=" * 80 + "\n\n")
+
+        if consolidated and do_disassembly:
+            asm_path = os.path.join(export_dir, "disassembly.asm")
+            fresh = not os.path.exists(asm_path)
+            files['disasm'] = open(asm_path, 'a', encoding='utf-8', buffering=1 << 20)
+            if fresh:
+                files['disasm'].write("; Consolidated disassembly\n\n")
+
+        if consolidated and do_callgraph:
+            cg_path = os.path.join(export_dir, "callgraph.txt")
+            fresh = not os.path.exists(cg_path)
+            files['callgraph_txt'] = open(cg_path, 'a', encoding='utf-8', buffering=1 << 20)
+            if fresh:
+                files['callgraph_txt'].write("# Call graph (full, streamed)\n")
+                files['callgraph_txt'].write("# Format: func_addr | func_name -> callee_addr:callee_name, ...\n")
+                files['callgraph_txt'].write("#" + "=" * 80 + "\n\n")
 
         if do_comments:
             files['comments'] = open(os.path.join(export_dir, "comments.txt"), 'w', encoding='utf-8')
@@ -3133,16 +3331,11 @@ def export_per_function_pass(export_dir, skip_tasks=None):
                     files['chunks'].write("  total size: 0x{:X}\n\n".format(total_size))
                     counts['chunks'] += 1
 
-            # --- Callgraph (collect in memory) ---
-            if do_callgraph:
-                func_names_map[func_ea] = func_name
-                callees = get_callees(func_ea)
-                addr_key = hex(func_ea)
-                callgraph[addr_key] = {
-                    "name": func_names_map.get(func_ea, "unknown"),
-                    "calls": [hex(c) for c in callees],
-                    "call_names": [func_names_map.get(c, idc.get_func_name(c) or "unknown") for c in callees]
-                }
+            # --- Callgraph for library/invalid functions ---
+            # Real functions get their callees from the merged head walk below; these
+            # ones bail out before it, so they are handled here (unchanged coverage).
+            if do_callgraph and (func is None or is_lib):
+                write_callgraph_entry(func_ea, func_name, get_callees(func_ea))
 
             # Skip library functions for the heavier per-instruction analyses
             if func is None or is_lib:
@@ -3231,29 +3424,13 @@ def export_per_function_pass(export_dir, skip_tasks=None):
                             files['stack_frames'].write("    {} {} : {}{}\n".format(kind, lv.name, tstr, loc))
                     files['stack_frames'].write("\n")
 
-            # Write decompiled output
+            # Evaluate pseudocode now, write it after the head walk (the walk
+            # supplies the callee list for the metadata header)
+            pending_dec_str = None
             if do_decompile and cfunc is not None and func_ea not in processed_addrs:
                 dec_str = str(cfunc)
                 if dec_str and len(dec_str.strip()) > 0:
-                    callers = get_callers(func_ea)
-                    callees_dec = get_callees(func_ea)
-                    output_lines = []
-                    output_lines.append("/*")
-                    output_lines.append(" * func-name: {}".format(func_name))
-                    output_lines.append(" * func-address: {}".format(hex(func_ea)))
-                    output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
-                    output_lines.append(" * callees: {}".format(format_address_list(callees_dec) if callees_dec else "none"))
-                    output_lines.append(" */")
-                    output_lines.append("")
-                    output_lines.append(dec_str)
-                    output_path = os.path.join(decompile_dir, "{:X}.c".format(func_ea))
-                    try:
-                        with open(output_path, 'w', encoding='utf-8') as df:
-                            df.write('\n'.join(output_lines))
-                        counts['decompiled'] += 1
-                    except IOError as e:
-                        failed_funcs.append((func_ea, func_name, "IO error: {}".format(str(e))))
-                    processed_addrs.add(func_ea)
+                    pending_dec_str = dec_str
                 else:
                     failed_funcs.append((func_ea, func_name, "empty decompilation result"))
                     processed_addrs.add(func_ea)
@@ -3272,9 +3449,8 @@ def export_per_function_pass(export_dir, skip_tasks=None):
                     for i in range(sv.size()):
                         line = ida_lines.tag_remove(sv[i].line) if hasattr(ida_lines, 'tag_remove') else str(sv[i].line)
                         lines.append(line)
-                    output_path = os.path.join(micro_dir, "{:X}.ctree".format(func_ea))
-                    with open(output_path, 'w', encoding='utf-8') as mf:
-                        mf.write('\n'.join(lines))
+                    write_file_async(os.path.join(micro_dir, "{:X}.ctree".format(func_ea)),
+                                     '\n'.join(lines))
                     counts['microcode'] += 1
                 except:
                     pass
@@ -3282,119 +3458,146 @@ def export_per_function_pass(export_dir, skip_tasks=None):
             # Release cfunc
             cfunc = None
 
-            # --- Disassembly ---
-            if do_disassembly:
-                lines = []
-                lines.append("; function: {} at {}".format(func_name, hex(func_ea)))
-                lines.append("; size: {} bytes".format(func.end_ea - func.start_ea))
-                lines.append("")
-                for head in idautils.Heads(func.start_ea, func.end_ea):
-                    flags = idc.get_full_flags(head)
-                    if idc.is_code(flags):
-                        disasm = idc.GetDisasm(head)
-                        size = idc.get_item_size(head)
-                        raw_bytes = ""
-                        for i in range(min(size, 16)):
-                            raw_bytes += "{:02X} ".format(ida_bytes.get_byte(head + i))
-                        lines.append("{} | {:20s} | {}".format(hex(head), raw_bytes.strip(), disasm))
-                output_path = os.path.join(disasm_dir, "{:X}.asm".format(func_ea))
-                with open(output_path, 'w', encoding='utf-8') as df:
-                    df.write('\n'.join(lines))
-                counts['disasm_exported'] += 1
+            # --- Single walk over this function's heads ---
+            # One pass feeds disassembly, callees, switch tables, exception hints,
+            # debug mappings and operand info. This used to be three walks per
+            # function (disassembly, get_callees, per-instruction analyses).
+            func_callees = set()
+            need_callees = do_callgraph or do_decompile
 
-            # --- Per-instruction analyses: switch tables, exceptions, debug info, operand types ---
+            disasm_lines = None
+            if do_disassembly:
+                disasm_lines = []
+                disasm_lines.append("; function: {} at {}".format(func_name, hex(func_ea)))
+                disasm_lines.append("; size: {} bytes".format(func.end_ea - func.start_ea))
+                disasm_lines.append("")
+
             func_has_debug = False
             func_written_operand = False
             has_eh = False
             eh_indicators = []
 
-            if do_switch or do_exceptions or do_debug or do_operand:
-                for head in idautils.Heads(func.start_ea, func.end_ea):
-                    # Switch tables
-                    if do_switch:
-                        si = ida_nalt.get_switch_info(head)
-                        if si is not None:
-                            ncases = si.get_jtable_size()
-                            files['switch'].write("=" * 60 + "\n")
-                            files['switch'].write("Switch at {} in {}\n".format(hex(head), func_name))
-                            files['switch'].write("  Jump table at: {}\n".format(hex(si.jumps)))
-                            files['switch'].write("  Cases: {}\n".format(ncases))
-                            files['switch'].write("  Element size: {}\n".format(si.get_jtable_element_size()))
-                            elem_size = si.get_jtable_element_size()
-                            for i in range(ncases):
-                                target_ea = si.jumps + i * elem_size
-                                try:
-                                    if elem_size == 4:
-                                        offset = ida_bytes.get_dword(target_ea)
-                                    elif elem_size == 8:
-                                        offset = ida_bytes.get_qword(target_ea)
-                                    elif elem_size == 2:
-                                        offset = ida_bytes.get_word(target_ea)
-                                    else:
-                                        offset = ida_bytes.get_dword(target_ea)
-                                    if si.flags & 0x1:
-                                        if elem_size == 4 and offset > 0x7FFFFFFF:
-                                            offset -= 0x100000000
-                                    target = si.elbase + offset if hasattr(si, 'elbase') else offset
-                                    files['switch'].write("  case {}: -> {}\n".format(i, hex(target)))
-                                except:
-                                    files['switch'].write("  case {}: -> <read error>\n".format(i))
-                            files['switch'].write("\n")
-                            counts['switch'] += 1
+            for head in idautils.Heads(func.start_ea, func.end_ea):
+                head_flags = idc.get_full_flags(head)
+                is_code = idc.is_code(head_flags)
 
-                    head_flags = idc.get_full_flags(head)
-                    is_code = idc.is_code(head_flags)
+                # GetDisasm is expensive; compute once per head and share it
+                disasm = None
+                if is_code and (do_disassembly or do_exceptions):
+                    disasm = idc.GetDisasm(head)
 
-                    # Exceptions
-                    if do_exceptions and is_code:
-                        disasm = idc.GetDisasm(head)
-                        if any(x in disasm.lower() for x in
-                               ['__cxa_begin_catch', '__cxa_end_catch', '__cxa_throw',
-                                '_except_handler', 'unwind', '__try', '__except',
-                                'personality', 'lsda', 'landing_pad']):
-                            eh_indicators.append((head, disasm))
-                            has_eh = True
+                # Disassembly
+                if do_disassembly and is_code:
+                    size = idc.get_item_size(head)
+                    raw_bytes = ""
+                    for i in range(min(size, 16)):
+                        raw_bytes += "{:02X} ".format(ida_bytes.get_byte(head + i))
+                    disasm_lines.append("{} | {:20s} | {}".format(hex(head), raw_bytes.strip(), disasm))
 
-                    # Debug info
-                    if do_debug:
-                        try:
-                            srcfile = idc.get_sourcefile(head)
-                            srcline = idc.get_source_linnum(head)
-                            if srcfile or srcline:
-                                if not func_has_debug:
-                                    files['debug'].write("\n{} ({})\n".format(func_name, hex(func_ea)))
-                                    func_has_debug = True
-                                files['debug'].write("  {} | {}:{}\n".format(
-                                    hex(head),
-                                    srcfile if srcfile else "?",
-                                    srcline if srcline else "?"))
-                                counts['debug'] += 1
-                        except:
-                            pass
+                # Callees (same xref walk get_callees() does, folded into this pass)
+                if need_callees and is_code:
+                    for ref in idautils.XrefsFrom(head, 0):
+                        if ref.type in [ida_xref.fl_CF, ida_xref.fl_CN]:
+                            callee_func = ida_funcs.get_func(ref.to)
+                            if callee_func:
+                                func_callees.add(callee_func.start_ea)
 
-                    # Operand types
-                    if do_operand and is_code:
-                        has_interesting = False
-                        ops_info = []
-                        for n in range(8):
-                            ot = idc.get_operand_type(head, n)
-                            if ot == 0:
-                                break
-                            ov = idc.get_operand_value(head, n)
-                            if ot == 5:
-                                if idc.is_defarg0(head_flags) and n == 0:
-                                    has_interesting = True
-                                elif idc.is_defarg1(head_flags) and n == 1:
-                                    has_interesting = True
-                            type_name = OP_NAMES.get(ot, "type_{}".format(ot))
-                            ops_info.append("op{}={}({})".format(n, type_name, hex(ov) if ov else "0"))
-                        if has_interesting and ops_info:
-                            if not func_written_operand:
-                                files['operand'].write("\n## {} ({})\n".format(func_name, hex(func_ea)))
-                                func_written_operand = True
-                            disasm = idc.GetDisasm(head)
-                            files['operand'].write("  {} | {} | {}\n".format(hex(head), disasm, " ".join(ops_info)))
-                            counts['operand'] += 1
+                # Switch tables
+                if do_switch:
+                    si = ida_nalt.get_switch_info(head)
+                    if si is not None:
+                        ncases = si.get_jtable_size()
+                        files['switch'].write("=" * 60 + "\n")
+                        files['switch'].write("Switch at {} in {}\n".format(hex(head), func_name))
+                        files['switch'].write("  Jump table at: {}\n".format(hex(si.jumps)))
+                        files['switch'].write("  Cases: {}\n".format(ncases))
+                        files['switch'].write("  Element size: {}\n".format(si.get_jtable_element_size()))
+                        elem_size = si.get_jtable_element_size()
+                        for i in range(ncases):
+                            target_ea = si.jumps + i * elem_size
+                            try:
+                                if elem_size == 4:
+                                    offset = ida_bytes.get_dword(target_ea)
+                                elif elem_size == 8:
+                                    offset = ida_bytes.get_qword(target_ea)
+                                elif elem_size == 2:
+                                    offset = ida_bytes.get_word(target_ea)
+                                else:
+                                    offset = ida_bytes.get_dword(target_ea)
+                                if si.flags & 0x1:
+                                    if elem_size == 4 and offset > 0x7FFFFFFF:
+                                        offset -= 0x100000000
+                                target = si.elbase + offset if hasattr(si, 'elbase') else offset
+                                files['switch'].write("  case {}: -> {}\n".format(i, hex(target)))
+                            except:
+                                files['switch'].write("  case {}: -> <read error>\n".format(i))
+                        files['switch'].write("\n")
+                        counts['switch'] += 1
+
+                # Exceptions
+                if do_exceptions and is_code:
+                    if any(x in disasm.lower() for x in
+                           ['__cxa_begin_catch', '__cxa_end_catch', '__cxa_throw',
+                            '_except_handler', 'unwind', '__try', '__except',
+                            'personality', 'lsda', 'landing_pad']):
+                        eh_indicators.append((head, disasm))
+                        has_eh = True
+
+                # Debug info
+                if do_debug:
+                    try:
+                        srcfile = idc.get_sourcefile(head)
+                        srcline = idc.get_source_linnum(head)
+                        if srcfile or srcline:
+                            if not func_has_debug:
+                                files['debug'].write("\n{} ({})\n".format(func_name, hex(func_ea)))
+                                func_has_debug = True
+                            files['debug'].write("  {} | {}:{}\n".format(
+                                hex(head),
+                                srcfile if srcfile else "?",
+                                srcline if srcline else "?"))
+                            counts['debug'] += 1
+                    except:
+                        pass
+
+                # Operand types
+                if do_operand and is_code:
+                    has_interesting = False
+                    ops_info = []
+                    for n in range(8):
+                        ot = idc.get_operand_type(head, n)
+                        if ot == 0:
+                            break
+                        ov = idc.get_operand_value(head, n)
+                        if ot == 5:
+                            if idc.is_defarg0(head_flags) and n == 0:
+                                has_interesting = True
+                            elif idc.is_defarg1(head_flags) and n == 1:
+                                has_interesting = True
+                        type_name = OP_NAMES.get(ot, "type_{}".format(ot))
+                        ops_info.append("op{}={}({})".format(n, type_name, hex(ov) if ov else "0"))
+                    if has_interesting and ops_info:
+                        if not func_written_operand:
+                            files['operand'].write("\n## {} ({})\n".format(func_name, hex(func_ea)))
+                            func_written_operand = True
+                        files['operand'].write("  {} | {} | {}\n".format(
+                            hex(head), idc.GetDisasm(head), " ".join(ops_info)))
+                        counts['operand'] += 1
+
+            func_callees = sorted(func_callees)
+
+            # --- Write disassembly ---
+            if do_disassembly:
+                asm_text = '\n'.join(disasm_lines)
+                if consolidated:
+                    files['disasm'].write(asm_text + "\n\n")
+                else:
+                    write_file_async(os.path.join(disasm_dir, "{:X}.asm".format(func_ea)), asm_text)
+                counts['disasm_exported'] += 1
+
+            # --- Callgraph entry for this function ---
+            if do_callgraph:
+                write_callgraph_entry(func_ea, func_name, func_callees)
 
             # Exceptions: write if found
             if do_exceptions:
@@ -3410,15 +3613,67 @@ def export_per_function_pass(export_dir, skip_tasks=None):
                     files['exceptions'].write("\n")
                     counts['exceptions'] += 1
 
+
+            # --- Write decompiled output ---
+            # After the walk on purpose: callees come from it, and Hex-Rays has by
+            # now applied data types, so the .asm above shows real data names.
+            if pending_dec_str is not None:
+                callers = get_callers(func_ea)
+                callees_dec = func_callees
+                output_lines = []
+                output_lines.append("/*")
+                output_lines.append(" * func-name: {}".format(func_name))
+                output_lines.append(" * func-address: {}".format(hex(func_ea)))
+                output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
+                output_lines.append(" * callees: {}".format(format_address_list(callees_dec) if callees_dec else "none"))
+                output_lines.append(" */")
+                output_lines.append("")
+                output_lines.append(pending_dec_str)
+                if consolidated:
+                    try:
+                        files['decompiled'].write('\n'.join(output_lines) + "\n\n")
+                        files['func_list'].write("{:X} | {} | decompile\n".format(func_ea, func_name))
+                        counts['decompiled'] += 1
+                    except IOError as e:
+                        failed_funcs.append((func_ea, func_name, "IO error: {}".format(str(e))))
+                else:
+                    try:
+                        write_file_async(os.path.join(decompile_dir, "{:X}.c".format(func_ea)),
+                                         '\n'.join(output_lines))
+                        counts['decompiled'] += 1
+                    except IOError as e:
+                        failed_funcs.append((func_ea, func_name, "IO error: {}".format(str(e))))
+                processed_addrs.add(func_ea)
+
+
             # Periodic cleanup
             if (idx + 1) % 200 == 0:
                 clear_undo_buffer()
                 gc.collect()
                 if do_decompile:
                     save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
+                for key in ('decompiled', 'func_list', 'disasm', 'callgraph_txt'):
+                    if key in files:
+                        try:
+                            files[key].flush()
+                        except Exception:
+                            pass
+                drain_io()
 
-        # --- Write callgraph JSON ---
-        if do_callgraph:
+            # Hex-Rays caches cfunc_t at ~130KB/func; without this it grows forever
+            cache_interval = (DECOMPILE_CACHE_CLEAR_CONSOLIDATED if consolidated
+                              else DECOMPILE_CACHE_CLEAR_LEGACY)
+            if (idx + 1) % cache_interval == 0:
+                try:
+                    ida_hexrays.clear_cached_cfuncs()
+                except Exception:
+                    pass
+
+        # --- Write callgraph ---
+        if do_callgraph and consolidated:
+            print("[*] Call Graph: streamed to callgraph.txt, {} edges".format(
+                counts['callgraph_edges']))
+        elif do_callgraph:
             callgraph_path = os.path.join(export_dir, "callgraph.json")
             with open(callgraph_path, 'w', encoding='utf-8') as f:
                 json.dump(callgraph, f, indent=2)
@@ -3474,6 +3729,9 @@ def export_per_function_pass(export_dir, skip_tasks=None):
             print("    Microcode/ctree: {}".format(counts['microcode']))
 
     finally:
+        if io_pool is not None:
+            drain_io(force=True)
+            io_pool.shutdown(wait=True)
         for fobj in files.values():
             try:
                 fobj.close()
@@ -3960,7 +4218,78 @@ def export_per_name_pass(export_dir, skip_tasks=None):
                 pass
 
 
-def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_count=None, skip_tasks=None):
+def write_agents_md(export_dir, resolved_mode, total_funcs=0, skipped_memory=False):
+    """Write AGENTS.md so an AI can navigate the export without relearning it.
+
+    Picked up by Cursor / Claude Code / Codex. ~1-2KB of tokens.
+    """
+    path = os.path.join(export_dir, "AGENTS.md")
+    consolidated = (resolved_mode == EXPORT_MODE_CONSOLIDATED)
+
+    lines = []
+    lines.append("# IDA Export for AI Analysis\n\n")
+    lines.append("Exported by INP.py (idaxport). Navigation guide below.\n\n")
+    lines.append("## Export mode\n\n")
+    lines.append("- resolved mode: `{}`\n".format(resolved_mode))
+    lines.append("- total functions: {}\n".format(total_funcs))
+    lines.append("- legacy = one file per function; consolidated = merged single files "
+                 "(large binaries, avoids file-count and token blowup)\n\n")
+    lines.append("## Layout\n\n")
+    lines.append("| Path | Contents | Mode |\n")
+    lines.append("| ---- | -------- | ---- |\n")
+    lines.append("| `decompiled.c` | all pseudocode, metadata header per function | consolidated |\n")
+    lines.append("| `disassembly.asm` | all disassembly | consolidated |\n")
+    lines.append("| `function_list.txt` | one line per exported function | consolidated |\n")
+    lines.append("| `callgraph.txt` | full call graph, one line per function | consolidated |\n")
+    lines.append("| `decompile/<addr>.c` | pseudocode, one file per function | legacy |\n")
+    lines.append("| `disassembly/<addr>.asm` | disassembly, one file per function | legacy |\n")
+    lines.append("| `microcode/<addr>.ctree` | Hex-Rays ctree | legacy |\n")
+    lines.append("| `callgraph.json` | full adjacency list | legacy |\n")
+    lines.append("| `strings.txt`, `string_xrefs.txt` | strings and their xrefs | always |\n")
+    lines.append("| `imports.txt`, `imports_grouped.txt`, `exports.txt`, `entry_points.txt` | symbol tables | always |\n")
+    lines.append("| `prototypes.txt`, `stack_frames.txt` | signatures, frame layouts | always |\n")
+    lines.append("| `structs_enums.txt`, `applied_structs.txt`, `vtables.txt` | types, RTTI | always |\n")
+    lines.append("| `segments.txt`, `binary_info.txt`, `fixups.txt` | binary layout | always |\n")
+    lines.append("| `xrefs.txt`, `data_xref_graph.txt`, `globals.txt` | references, data | always |\n")
+    lines.append("| `comments.txt`, `bookmarks.txt`, `colors.txt` | analyst annotations | always |\n")
+    lines.append("| `switch_tables.txt`, `exceptions.txt`, `function_chunks.txt` | control flow details | always |\n")
+    lines.append("| `memory/` | raw hexdump | legacy only |\n")
+    lines.append("| `decompile_failed.txt`, `decompile_skipped.txt` | functions with no pseudocode | when non-empty |\n\n")
+    lines.append("## Function metadata header\n\n")
+    lines.append("```c\n")
+    lines.append("/*\n")
+    lines.append(" * func-name: sub_401000\n")
+    lines.append(" * func-address: 0x401000\n")
+    lines.append(" * callers: 0x402000, 0x403000\n")
+    lines.append(" * callees: 0x404000\n")
+    lines.append(" */\n")
+    lines.append("```\n\n")
+    lines.append("## Suggested workflow\n\n")
+    lines.append("1. Read `imports.txt` / `exports.txt` / `strings.txt` for a global picture\n")
+    lines.append("2. Find entry points via `entry_points.txt` or `callgraph.txt` / `callgraph.json`\n")
+    lines.append("3. Jump by address: grep `func-address: 0x401000` in `decompiled.c`, "
+                 "or open `decompile/401000.c`\n")
+    lines.append("4. Follow call chains through `callers` / `callees` or the callgraph\n")
+    lines.append("5. On large exports, index with `function_list.txt` + `callgraph.txt` instead of "
+                 "feeding `decompiled.c` wholesale to a model\n\n")
+    if consolidated:
+        lines.append("Notes: consolidated mode ({} functions) - per-function files are merged into "
+                     "`decompiled.c` / `disassembly.asm`; the call graph is in `callgraph.txt`.\n".format(total_funcs))
+    else:
+        lines.append("Notes: legacy mode - one file per function, full caller/callee lists in each header.\n")
+    if skipped_memory:
+        lines.append("`memory/` was skipped (raw hex is the biggest token sink, lowest analysis value).\n")
+
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        print("[+] AGENTS.md written (AI navigation context)")
+    except Exception as e:
+        print("[!] Failed to write AGENTS.md: {}".format(str(e)))
+
+
+def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_count=None, skip_tasks=None,
+              export_mode=None):
     """执行导出操作
 
     Args:
@@ -3968,6 +4297,7 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         ask_user: 是否询问用户选择目录
         skip_auto_analysis: 是否跳过等待自动分析（如果已经分析完成）
         worker_count: 并行工作线程数，默认为CPU核心数-1
+        export_mode: auto|legacy|consolidated (None -> EXPORT_MODE_DEFAULT)
     """
     global WORKER_COUNT
 
@@ -4027,8 +4357,7 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         _log_ts("auto_wait: SKIPPED (skip_auto_analysis=True)")
 
     if export_dir is None:
-        idb_dir = get_idb_directory()
-        default_export_dir = os.path.join(idb_dir, "export-for-ai")
+        default_export_dir = get_default_export_dir()
 
         if ask_user:
             choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
@@ -4063,6 +4392,17 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         _log_ts("skip_tasks: (none)")
     print("")
 
+    # Resolve export mode now that analysis is done (function count decides auto)
+    try:
+        mode_func_count = sum(1 for _ in idautils.Functions())
+    except Exception:
+        mode_func_count = 0
+    requested_mode = export_mode or EXPORT_MODE_DEFAULT
+    resolved_mode = _resolve_export_mode(requested_mode, mode_func_count)
+    consolidated = (resolved_mode == EXPORT_MODE_CONSOLIDATED)
+    _log_ts("export_mode: {} -> resolved={} ({} funcs)".format(
+        requested_mode, resolved_mode, mode_func_count))
+
     # Phase 1: Independent exports (not part of the 3 consolidated passes)
     independent_tasks = [
         ("Binary info",           export_binary_info),
@@ -4088,6 +4428,15 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     # Filter independent tasks by skip_tasks
     if skip_tasks:
         independent_tasks = [(n, f) for n, f in independent_tasks if n not in skip_tasks]
+
+    if consolidated:
+        # raw hexdump is the biggest token sink and the least useful to a model;
+        # strings get a min-length filter to drop noise
+        independent_tasks = [(n, f) for n, f in independent_tasks if n != "Memory"]
+        independent_tasks = [
+            (n, (lambda d: export_strings(d, min_len=LARGE_STRING_MIN_LEN)) if n == "Strings" else f)
+            for n, f in independent_tasks
+        ]
 
     def print_progress_bar(current, total, task_name, width=40):
         """Print an ASCII progress bar"""
@@ -4159,7 +4508,7 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     _t0 = time.time()
     _log_ts("phase4: BEGIN per-function pass (slow on large binaries)")
     try:
-        export_per_function_pass(export_dir, skip_tasks=skip_tasks)
+        export_per_function_pass(export_dir, skip_tasks=skip_tasks, export_mode=resolved_mode)
     except Exception as e:
         print("[!] Per-function pass failed: {}".format(str(e)))
         _log_ts("phase4: ERROR — {}".format(str(e)))
@@ -4171,6 +4520,12 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     elapsed = time.time() - start_time
     print_progress_bar(total_tasks, total_tasks, "DONE in {:.1f}s".format(elapsed))
     _log_ts("do_export: all phases finished in {:.1f}s total (export work only, excludes auto_wait)".format(elapsed))
+
+    try:
+        write_agents_md(export_dir, resolved_mode, mode_func_count,
+                        skipped_memory=consolidated)
+    except Exception as e:
+        print("[!] AGENTS.md generation failed: {}".format(str(e)))
 
     # 恢复撤销功能
     enable_undo()
@@ -4261,8 +4616,7 @@ if HAS_QT:
             # Output directory
             dir_group = QGroupBox("Output Directory")
             dir_layout = QHBoxLayout(dir_group)
-            idb_dir = get_idb_directory()
-            self.dir_edit = QLineEdit(os.path.join(idb_dir, "export-for-ai"))
+            self.dir_edit = QLineEdit(get_default_export_dir())
             self.dir_btn = QPushButton("Browse...")
             self.dir_btn.clicked.connect(self._on_browse)
             dir_layout.addWidget(self.dir_edit)
@@ -4524,16 +4878,21 @@ def PLUGIN_ENTRY():
 
 if __name__ == "__main__":
     # Standalone script mode (for batch/headless)
+    #   ARGV[1] = export_dir
+    #   ARGV[2] = "1" to skip the auto-analysis wait
+    #   ARGV[3] = export mode: auto | legacy | consolidated (default auto)
     argc = int(idc.eval_idc("ARGV.count"))
-    if argc < 2:
-        export_dir = None
-        skip_analysis = False
-    elif argc < 3:
+    export_dir = None
+    skip_analysis = False
+    export_mode = EXPORT_MODE_AUTO
+    if argc >= 2:
         export_dir = idc.eval_idc("ARGV[1]")
-        skip_analysis = False
-    else:
-        export_dir = idc.eval_idc("ARGV[1]")
+    if argc >= 3:
         skip_analysis = (idc.eval_idc("ARGV[2]") == "1")
+    if argc >= 4:
+        m = idc.eval_idc("ARGV[3]")
+        if m in EXPORT_MODES:
+            export_mode = m
 
     # Load skip_tasks from .skip file if it exists (written by GUI)
     skip_tasks = None
@@ -4545,7 +4904,8 @@ if __name__ == "__main__":
             print("[*] Skipping {} tasks from {}".format(len(skip_tasks), skip_file))
             os.remove(skip_file)  # clean up
 
-    do_export(export_dir, ask_user=False, skip_auto_analysis=skip_analysis, skip_tasks=skip_tasks)
+    do_export(export_dir, ask_user=False, skip_auto_analysis=skip_analysis, skip_tasks=skip_tasks,
+              export_mode=export_mode)
 
     if argc >= 2:
         idc.qexit(0)

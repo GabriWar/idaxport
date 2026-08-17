@@ -1,1 +1,29 @@
+# macOS
 .DS_Store
+
+
+Cargo.lock
+# Rust build output (very large; never commit)
+/target/
+**/*.rs.bk
+
+# Cargo lockfile — keep for the binary, but if this ever becomes a library, revisit.
+# (For a binary crate, committing Cargo.lock is fine; leaving it in.)
+
+# IDA database artifacts (never commit; can be gigabytes)
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.asm
+
+# Export output directories (regenerated, never commit)
+*_export_for_ai/
+
+# Benchmark scratch (kept under /tmp, but guard in case)
+*.mon
+NATIVE.md
+BENCHMARK.md
